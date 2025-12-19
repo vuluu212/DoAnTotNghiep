@@ -64,6 +64,7 @@
   const db  = getDatabase(app);
 
   // --------- URL params ----------
+  // ?id=USER_ID&type=topup|consumption
   const params = new URLSearchParams(window.location.search);
   const USER_ID = params.get("id") || params.get("uid") || "";
   const TYPE = (params.get("type") || "topup").toLowerCase(); // topup | consumption
@@ -92,16 +93,28 @@
 
   function pad2(n){ return String(n).padStart(2, "0"); }
 
-  // Label theo chế độ
+  // ISO week helper
+  function isoWeek(date) {
+    const dt = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+    const dayNum = dt.getUTCDay() || 7;
+    dt.setUTCDate(dt.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(dt.getUTCFullYear(), 0, 1));
+    const week = Math.ceil((((dt - yearStart) / 86400000) + 1) / 7);
+    return { week, weekYear: dt.getUTCFullYear() };
+  }
+
+  // Label theo chế độ (✅ năm 2025 -> 25)
   function labelForMode(mode, dt) {
-    const y = dt.getFullYear();
+    const y2 = String(dt.getFullYear()).slice(-2); // 2025 -> 25
     const m = pad2(dt.getMonth() + 1);
     const d = pad2(dt.getDate());
-    if (mode === "day") return `${d}/${m}`;              // dd/MM
-    if (mode === "month") return `${m}/${y}`;            // MM/YYYY
-    // week: "Wxx/YYYY"
+
+    if (mode === "day") return `${d}/${m}`;        // dd/MM
+    if (mode === "month") return `${m}/${y2}`;     // MM/YY
+
     const { week, weekYear } = isoWeek(dt);
-    return `W${pad2(week)}/${weekYear}`;
+    const wy2 = String(weekYear).slice(-2);
+    return `W${pad2(week)}/${wy2}`;                // Wxx/YY
   }
 
   // Key bucket theo chế độ (để group)
@@ -115,16 +128,6 @@
     return `${weekYear}-W${pad2(week)}`;                 // YYYY-Wxx
   }
 
-  // ISO week helper
-  function isoWeek(date) {
-    const dt = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
-    const dayNum = dt.getUTCDay() || 7;
-    dt.setUTCDate(dt.getUTCDate() + 4 - dayNum);
-    const yearStart = new Date(Date.UTC(dt.getUTCFullYear(), 0, 1));
-    const week = Math.ceil((((dt - yearStart) / 86400000) + 1) / 7);
-    return { week, weekYear: dt.getUTCFullYear() };
-  }
-
   // --------- Firebase paths ----------
   function pathByType(type) {
     if (type === "consumption") {
@@ -134,10 +137,6 @@
   }
 
   // --------- Load rows ----------
-  // TOPUP:
-  //   - value có thể là "50000" hoặc object {amount, balance_after}
-  // CONSUMPTION:
-  //   - value thường là number/string
   async function loadRows(type) {
     const snap = await get(ref(db, pathByType(type)));
     if (!snap.exists()) return [];
@@ -150,10 +149,13 @@
       if (type === "topup") {
         let amount = 0;
         let balanceAfter = null;
+
+        // object: {amount, balance_after}
         if (typeof v === "object" && v !== null) {
           amount = toNumber(v.amount);
           if (v.balance_after !== undefined) balanceAfter = toNumber(v.balance_after);
         } else {
+          // string/number: "50000"
           amount = toNumber(v);
         }
         return { key: k, date: dt, amount, balanceAfter };
@@ -169,46 +171,31 @@
 
   // --------- Group/Aggregate ----------
   function groupTopup(rows, mode) {
-    // amount: sum trong bucket
-    // balance: lấy balance_after cuối bucket nếu có, nếu không dùng cộng dồn (ước tính) tới cuối bucket
     const map = new Map();
 
     for (const r of rows) {
       const bk = bucketKey(mode, r.date);
       if (!map.has(bk)) {
-        map.set(bk, { bucket: bk, date: r.date, amountSum: 0, lastBalanceAfter: null, lastDate: r.date });
+        map.set(bk, { bucket: bk, amountSum: 0, lastBalanceAfter: null, lastDate: r.date });
       }
       const it = map.get(bk);
       it.amountSum += r.amount;
 
       if (r.date >= it.lastDate) {
         it.lastDate = r.date;
-        // ưu tiên balance_after thật
         if (r.balanceAfter !== null) it.lastBalanceAfter = r.balanceAfter;
       }
     }
 
-    // sort bucket theo thời gian: dùng "date" (đã set lần đầu) nhưng an toàn hơn: sort theo bucket string + mode
-    const grouped = Array.from(map.values()).sort((a,b) => {
-      // so sánh theo bucket key (định dạng YYYY-.. nên sort string ok cho day/month; week cũng ok)
-      return a.bucket.localeCompare(b.bucket);
-    });
+    const grouped = Array.from(map.values()).sort((a,b) => a.bucket.localeCompare(b.bucket));
 
-    // Nếu thiếu balance_after thật -> tạo balance ước tính cộng dồn
     let run = 0;
     const hasReal = grouped.some(g => g.lastBalanceAfter !== null);
 
     const out = grouped.map(g => {
-      if (hasReal) {
-        // nếu bucket nào thiếu lastBalanceAfter thì vẫn fallback bằng run (từ trước)
-        // nhưng run phải theo amountSum
-        run += g.amountSum;
-        const bal = (g.lastBalanceAfter !== null) ? g.lastBalanceAfter : run;
-        return { date: g.lastDate, amount: g.amountSum, balance: bal };
-      } else {
-        run += g.amountSum;
-        return { date: g.lastDate, amount: g.amountSum, balance: run };
-      }
+      run += g.amountSum; // cộng dồn theo bucket
+      const bal = (hasReal && g.lastBalanceAfter !== null) ? g.lastBalanceAfter : run;
+      return { date: g.lastDate, amount: g.amountSum, balance: bal };
     });
 
     return { points: out, hasRealBalance: hasReal };
@@ -218,7 +205,7 @@
     const map = new Map();
     for (const r of rows) {
       const bk = bucketKey(mode, r.date);
-      if (!map.has(bk)) map.set(bk, { bucket: bk, date: r.date, sum: 0, lastDate: r.date });
+      if (!map.has(bk)) map.set(bk, { bucket: bk, sum: 0, lastDate: r.date });
       const it = map.get(bk);
       it.sum += r.value;
       if (r.date >= it.lastDate) it.lastDate = r.date;
@@ -230,7 +217,6 @@
   // --------- Chart init ----------
   const ctx = document.getElementById("chart");
 
-  // dataset cấu hình theo TYPE
   const chart = new Chart(ctx, {
     type: "line",
     data: { labels: [], datasets: [] },
@@ -239,12 +225,18 @@
       maintainAspectRatio: false,
       plugins: {
         title: { display: false }, // ✅ bỏ title
-        legend: { display: true }  // vẫn hiện chú thích 2 line
+        legend: { display: true }
       },
       scales: {
         y: {
           ticks: {
-            callback: (v) => Number(v).toLocaleString("vi-VN")
+            // ✅ Topup: hiển thị nghìn (đã chia 1000 ở data) -> 300.000 => 300
+            // Consumption: giữ nguyên
+            callback: (v) => {
+              const num = Number(v);
+              if (!Number.isFinite(num)) return v;
+              return num.toLocaleString("vi-VN");
+            }
           }
         }
       }
@@ -252,28 +244,15 @@
   });
 
   function setDatasetsForType(type, topupHasRealBalance) {
-    chart.data.datasets = [];
-
     if (type === "topup") {
-      chart.data.datasets.push({
-        label: "Tiền nạp",
-        data: [],
-        tension: 0.25,
-        pointRadius: 3
-      });
-      chart.data.datasets.push({
-        label: topupHasRealBalance ? "Số dư sau nạp" : "Số dư sau nạp (ước tính)",
-        data: [],
-        tension: 0.25,
-        pointRadius: 3
-      });
+      chart.data.datasets = [
+        { label: "Tiền nạp (nghìn)", data: [], tension: 0.25, pointRadius: 3 },
+        { label: topupHasRealBalance ? "Số dư sau nạp (nghìn)" : "Số dư sau nạp (nghìn, ước tính)", data: [], tension: 0.25, pointRadius: 3 }
+      ];
     } else {
-      chart.data.datasets.push({
-        label: "Tiêu thụ",
-        data: [],
-        tension: 0.25,
-        pointRadius: 3
-      });
+      chart.data.datasets = [
+        { label: "Tiêu thụ", data: [], tension: 0.25, pointRadius: 3 }
+      ];
     }
   }
 
@@ -303,8 +282,10 @@
     setDatasetsForType("topup", hasRealBalance);
 
     chart.data.labels = grouped.map(p => fmtX(p.date));
-    chart.data.datasets[0].data = grouped.map(p => p.amount);
-    chart.data.datasets[1].data = grouped.map(p => p.balance);
+
+    // ✅ VND -> nghìn đồng
+    chart.data.datasets[0].data = grouped.map(p => p.amount / 1000);
+    chart.data.datasets[1].data = grouped.map(p => p.balance / 1000);
 
     chart.update();
   }
@@ -325,7 +306,6 @@
     try {
       const rows = await loadRows(TYPE);
 
-      // signature gồm (key + value...) để biết dữ liệu đổi chưa
       const sig = TYPE === "topup"
         ? JSON.stringify(rows.map(r => [r.key, r.amount, r.balanceAfter]))
         : JSON.stringify(rows.map(r => [r.key, r.value]));
