@@ -25,8 +25,8 @@
       font-weight: 600;
     }
     .btn.active {
-      border-color: #111827;
-      background: #111827;
+      border-color: #007B39FF;
+      background: #007B39FF;
       color: #fff;
     }
     .canvas-wrap { flex: 1; padding: 10px; box-sizing: border-box; }
@@ -247,11 +247,11 @@
     if (type === "topup") {
       chart.data.datasets = [
         { label: "Tiền nạp (nghìn)", data: [], tension: 0.25, pointRadius: 3 },
-        { label: topupHasRealBalance ? "Số dư sau nạp (nghìn)" : "Số dư sau nạp (nghìn, ước tính)", data: [], tension: 0.25, pointRadius: 3 }
+        { label: topupHasRealBalance ? "Số dư sau nạp (nghìn)" : "Số dư sau nạp (nghìn)", data: [], tension: 0.25, pointRadius: 3 }
       ];
     } else {
       chart.data.datasets = [
-        { label: "Tiêu thụ", data: [], tension: 0.25, pointRadius: 3 }
+        { label: "Điện năng đã sạc", data: [], tension: 0.25, pointRadius: 3 }
       ];
     }
   }
