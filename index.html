@@ -8,12 +8,42 @@
   <style>
     html, body { height: 100%; margin: 0; }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-    .wrap { height: 100%; padding: 10px; box-sizing: border-box; }
+    .wrap { height: 100%; display: flex; flex-direction: column; }
+    .bar {
+      padding: 10px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    .btn {
+      padding: 8px 12px;
+      border-radius: 10px;
+      border: 1px solid #d1d5db;
+      background: #fff;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn.active {
+      border-color: #111827;
+      background: #111827;
+      color: #fff;
+    }
+    .canvas-wrap { flex: 1; padding: 10px; box-sizing: border-box; }
     canvas { width: 100% !important; height: 100% !important; }
   </style>
 </head>
 <body>
-  <div class="wrap"><canvas id="chart"></canvas></div>
+  <div class="wrap">
+    <div class="bar">
+      <button class="btn" id="btnDay">Ngày</button>
+      <button class="btn" id="btnWeek">Tuần</button>
+      <button class="btn" id="btnMonth">Tháng</button>
+    </div>
+    <div class="canvas-wrap">
+      <canvas id="chart"></canvas>
+    </div>
+  </div>
 
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js";
@@ -34,10 +64,9 @@
   const db  = getDatabase(app);
 
   // --------- URL params ----------
-  // ?id=USER_ID&type=topup|consumption
   const params = new URLSearchParams(window.location.search);
   const USER_ID = params.get("id") || params.get("uid") || "";
-  const TYPE = (params.get("type") || "topup").toLowerCase();
+  const TYPE = (params.get("type") || "topup").toLowerCase(); // topup | consumption
 
   if (!USER_ID) {
     document.body.innerHTML =
@@ -61,114 +90,263 @@
     return Number.isFinite(n) ? n : 0;
   }
 
-  function fmtLabel(dt) {
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${pad(dt.getDate())}/${pad(dt.getMonth()+1)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+  function pad2(n){ return String(n).padStart(2, "0"); }
+
+  // Label theo chế độ
+  function labelForMode(mode, dt) {
+    const y = dt.getFullYear();
+    const m = pad2(dt.getMonth() + 1);
+    const d = pad2(dt.getDate());
+    if (mode === "day") return `${d}/${m}`;              // dd/MM
+    if (mode === "month") return `${m}/${y}`;            // MM/YYYY
+    // week: "Wxx/YYYY"
+    const { week, weekYear } = isoWeek(dt);
+    return `W${pad2(week)}/${weekYear}`;
   }
 
-  // --------- Load data by type ----------
-  function getPathByType(type) {
+  // Key bucket theo chế độ (để group)
+  function bucketKey(mode, dt) {
+    const y = dt.getFullYear();
+    const m = pad2(dt.getMonth() + 1);
+    const d = pad2(dt.getDate());
+    if (mode === "day") return `${y}-${m}-${d}`;         // YYYY-MM-DD
+    if (mode === "month") return `${y}-${m}`;            // YYYY-MM
+    const { week, weekYear } = isoWeek(dt);
+    return `${weekYear}-W${pad2(week)}`;                 // YYYY-Wxx
+  }
+
+  // ISO week helper
+  function isoWeek(date) {
+    const dt = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+    const dayNum = dt.getUTCDay() || 7;
+    dt.setUTCDate(dt.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(dt.getUTCFullYear(), 0, 1));
+    const week = Math.ceil((((dt - yearStart) / 86400000) + 1) / 7);
+    return { week, weekYear: dt.getUTCFullYear() };
+  }
+
+  // --------- Firebase paths ----------
+  function pathByType(type) {
     if (type === "consumption") {
       return `EVCharging/Users/${USER_ID}/Charging/History_Electric_Consumption`;
     }
-    // default topup
     return `EVCharging/Users/${USER_ID}/Wallet/History_topup`;
   }
 
-  function getMetaByType(type) {
-    if (type === "consumption") {
-      return {
-        title: "Tổng công suất tiêu thụ",
-        yLabel: "Công suất tiêu thụ",
-        unit: "W" // hoặc Wh/kWh tùy bạn đang lưu
-      };
-    }
-    return {
-      title: "Lịch sử nạp tiền",
-      yLabel: "Tiền nạp",
-      unit: "VND"
-    };
-  }
-
+  // --------- Load rows ----------
+  // TOPUP:
+  //   - value có thể là "50000" hoặc object {amount, balance_after}
+  // CONSUMPTION:
+  //   - value thường là number/string
   async function loadRows(type) {
-    const path = getPathByType(type);
-    const snap = await get(ref(db, path));
+    const snap = await get(ref(db, pathByType(type)));
     if (!snap.exists()) return [];
 
-    const obj = snap.val(); // { "2025-...": 100, ... } hoặc "50000"
+    const obj = snap.val();
     const rows = Object.entries(obj).map(([k, v]) => {
       const dt = parseKeyToDate(k);
-      return { key: k, date: dt, value: toNumber(v) };
-    }).filter(r => r.date !== null);
+      if (!dt) return null;
 
-    rows.sort((a, b) => a.date - b.date);
+      if (type === "topup") {
+        let amount = 0;
+        let balanceAfter = null;
+        if (typeof v === "object" && v !== null) {
+          amount = toNumber(v.amount);
+          if (v.balance_after !== undefined) balanceAfter = toNumber(v.balance_after);
+        } else {
+          amount = toNumber(v);
+        }
+        return { key: k, date: dt, amount, balanceAfter };
+      }
+
+      // consumption
+      return { key: k, date: dt, value: toNumber(v) };
+    }).filter(Boolean);
+
+    rows.sort((a,b) => a.date - b.date);
     return rows;
   }
 
-  // --------- Chart ----------
-  const meta = getMetaByType(TYPE);
-  const chart = new Chart(document.getElementById("chart"), {
+  // --------- Group/Aggregate ----------
+  function groupTopup(rows, mode) {
+    // amount: sum trong bucket
+    // balance: lấy balance_after cuối bucket nếu có, nếu không dùng cộng dồn (ước tính) tới cuối bucket
+    const map = new Map();
+
+    for (const r of rows) {
+      const bk = bucketKey(mode, r.date);
+      if (!map.has(bk)) {
+        map.set(bk, { bucket: bk, date: r.date, amountSum: 0, lastBalanceAfter: null, lastDate: r.date });
+      }
+      const it = map.get(bk);
+      it.amountSum += r.amount;
+
+      if (r.date >= it.lastDate) {
+        it.lastDate = r.date;
+        // ưu tiên balance_after thật
+        if (r.balanceAfter !== null) it.lastBalanceAfter = r.balanceAfter;
+      }
+    }
+
+    // sort bucket theo thời gian: dùng "date" (đã set lần đầu) nhưng an toàn hơn: sort theo bucket string + mode
+    const grouped = Array.from(map.values()).sort((a,b) => {
+      // so sánh theo bucket key (định dạng YYYY-.. nên sort string ok cho day/month; week cũng ok)
+      return a.bucket.localeCompare(b.bucket);
+    });
+
+    // Nếu thiếu balance_after thật -> tạo balance ước tính cộng dồn
+    let run = 0;
+    const hasReal = grouped.some(g => g.lastBalanceAfter !== null);
+
+    const out = grouped.map(g => {
+      if (hasReal) {
+        // nếu bucket nào thiếu lastBalanceAfter thì vẫn fallback bằng run (từ trước)
+        // nhưng run phải theo amountSum
+        run += g.amountSum;
+        const bal = (g.lastBalanceAfter !== null) ? g.lastBalanceAfter : run;
+        return { date: g.lastDate, amount: g.amountSum, balance: bal };
+      } else {
+        run += g.amountSum;
+        return { date: g.lastDate, amount: g.amountSum, balance: run };
+      }
+    });
+
+    return { points: out, hasRealBalance: hasReal };
+  }
+
+  function groupConsumption(rows, mode) {
+    const map = new Map();
+    for (const r of rows) {
+      const bk = bucketKey(mode, r.date);
+      if (!map.has(bk)) map.set(bk, { bucket: bk, date: r.date, sum: 0, lastDate: r.date });
+      const it = map.get(bk);
+      it.sum += r.value;
+      if (r.date >= it.lastDate) it.lastDate = r.date;
+    }
+    const grouped = Array.from(map.values()).sort((a,b) => a.bucket.localeCompare(b.bucket));
+    return grouped.map(g => ({ date: g.lastDate, value: g.sum }));
+  }
+
+  // --------- Chart init ----------
+  const ctx = document.getElementById("chart");
+
+  // dataset cấu hình theo TYPE
+  const chart = new Chart(ctx, {
     type: "line",
-    data: {
-      labels: [],
-      datasets: [{
-        label: `${meta.yLabel} (${meta.unit})`,
-        data: [],
-        tension: 0.25,
-        pointRadius: 3
-      }]
-    },
+    data: { labels: [], datasets: [] },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       plugins: {
-        title: { display: true, text: meta.title },
-        tooltip: {
-          callbacks: {
-            label: (ctx) => {
-              const v = ctx.parsed.y;
-              if (meta.unit === "VND") return ` ${v.toLocaleString("vi-VN")} VND`;
-              return ` ${v.toLocaleString("vi-VN")} ${meta.unit}`;
-            }
-          }
-        }
+        title: { display: false }, // ✅ bỏ title
+        legend: { display: true }  // vẫn hiện chú thích 2 line
       },
       scales: {
         y: {
           ticks: {
-            callback: (v) => meta.unit === "VND"
-              ? Number(v).toLocaleString("vi-VN")
-              : Number(v).toLocaleString("vi-VN")
+            callback: (v) => Number(v).toLocaleString("vi-VN")
           }
         }
       }
     }
   });
 
-  let lastSig = "";
+  function setDatasetsForType(type, topupHasRealBalance) {
+    chart.data.datasets = [];
 
-  function render(rows) {
-    chart.data.labels = rows.map(r => fmtLabel(r.date));
-    chart.data.datasets[0].data = rows.map(r => r.value);
+    if (type === "topup") {
+      chart.data.datasets.push({
+        label: "Tiền nạp",
+        data: [],
+        tension: 0.25,
+        pointRadius: 3
+      });
+      chart.data.datasets.push({
+        label: topupHasRealBalance ? "Số dư sau nạp" : "Số dư sau nạp (ước tính)",
+        data: [],
+        tension: 0.25,
+        pointRadius: 3
+      });
+    } else {
+      chart.data.datasets.push({
+        label: "Tiêu thụ",
+        data: [],
+        tension: 0.25,
+        pointRadius: 3
+      });
+    }
+  }
+
+  // --------- Mode buttons ----------
+  const btnDay   = document.getElementById("btnDay");
+  const btnWeek  = document.getElementById("btnWeek");
+  const btnMonth = document.getElementById("btnMonth");
+
+  let mode = "day"; // day | week | month
+
+  function setActive() {
+    btnDay.classList.toggle("active", mode === "day");
+    btnWeek.classList.toggle("active", mode === "week");
+    btnMonth.classList.toggle("active", mode === "month");
+  }
+
+  btnDay.onclick = () => { mode = "day"; setActive(); lastSig = ""; tick(true); };
+  btnWeek.onclick = () => { mode = "week"; setActive(); lastSig = ""; tick(true); };
+  btnMonth.onclick = () => { mode = "month"; setActive(); lastSig = ""; tick(true); };
+
+  setActive();
+
+  // --------- Render ----------
+  function fmtX(dt) { return labelForMode(mode, dt); }
+
+  function renderTopup(grouped, hasRealBalance) {
+    setDatasetsForType("topup", hasRealBalance);
+
+    chart.data.labels = grouped.map(p => fmtX(p.date));
+    chart.data.datasets[0].data = grouped.map(p => p.amount);
+    chart.data.datasets[1].data = grouped.map(p => p.balance);
+
     chart.update();
   }
 
-  async function tick() {
+  function renderConsumption(grouped) {
+    setDatasetsForType("consumption", false);
+
+    chart.data.labels = grouped.map(p => fmtX(p.date));
+    chart.data.datasets[0].data = grouped.map(p => p.value);
+
+    chart.update();
+  }
+
+  // --------- Auto refresh 2s ----------
+  let lastSig = "";
+
+  async function tick(force = false) {
     try {
       const rows = await loadRows(TYPE);
-      const sig = JSON.stringify(rows.map(r => [r.key, r.value]));
-      if (sig !== lastSig) {
-        lastSig = sig;
-        render(rows);
+
+      // signature gồm (key + value...) để biết dữ liệu đổi chưa
+      const sig = TYPE === "topup"
+        ? JSON.stringify(rows.map(r => [r.key, r.amount, r.balanceAfter]))
+        : JSON.stringify(rows.map(r => [r.key, r.value]));
+
+      if (!force && sig === lastSig) return;
+      lastSig = sig;
+
+      if (TYPE === "topup") {
+        const { points, hasRealBalance } = groupTopup(rows, mode);
+        renderTopup(points, hasRealBalance);
+      } else {
+        const points = groupConsumption(rows, mode);
+        renderConsumption(points);
       }
     } catch (e) {
       console.error(e);
     }
   }
 
-  // Auto refresh mỗi 2s
-  tick();
-  setInterval(tick, 2000);
+  tick(true);
+  setInterval(() => tick(false), 2000);
 
 </script>
 </body>
