@@ -5,17 +5,20 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>EV Chart</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
   <style>
     html, body { height: 100%; margin: 0; }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+
     .wrap { height: 100%; display: flex; flex-direction: column; }
+
     .bar {
       padding: 10px;
       display: flex;
       gap: 8px;
-      align-items: center;
       border-bottom: 1px solid #e5e7eb;
     }
+
     .btn {
       padding: 8px 12px;
       border-radius: 10px;
@@ -24,310 +27,207 @@
       cursor: pointer;
       font-weight: 600;
     }
+
     .btn.active {
-      border-color: #007B39FF;
-      background: #007B39FF;
+      background: #111827;
       color: #fff;
+      border-color: #111827;
     }
-    .canvas-wrap { flex: 1; padding: 10px; box-sizing: border-box; }
-    canvas { width: 100% !important; height: 100% !important; }
+
+    .canvas-wrap {
+      flex: 1;
+      padding: 10px;
+      box-sizing: border-box;
+      position: relative;
+    }
+
+    canvas {
+      width: 100% !important;
+      height: 100% !important;
+    }
+
+    .no-data {
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: #fff;
+    }
+
+    .no-data img {
+      max-width: 60%;
+      opacity: 0.9;
+    }
   </style>
 </head>
+
 <body>
-  <div class="wrap">
-    <div class="bar">
-      <button class="btn" id="btnDay">Ngày</button>
-      <button class="btn" id="btnWeek">Tuần</button>
-      <button class="btn" id="btnMonth">Tháng</button>
-    </div>
-    <div class="canvas-wrap">
-      <canvas id="chart"></canvas>
-    </div>
+<div class="wrap">
+  <div class="bar">
+    <button class="btn" id="btnDay">Ngày</button>
+    <button class="btn" id="btnWeek">Tuần</button>
+    <button class="btn" id="btnMonth">Tháng</button>
   </div>
 
+  <div class="canvas-wrap">
+    <canvas id="chart"></canvas>
+    <div class="no-data" id="noData">
+      <img src="no_data.png" alt="No data">
+    </div>
+  </div>
+</div>
+
 <script type="module">
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js";
-  import { getDatabase, ref, get } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-database.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js";
+import { getDatabase, ref, get } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-database.js";
 
-  // ✅ THAY firebaseConfig CỦA BẠN
-  const firebaseConfig = {
-    apiKey: "YOUR_API_KEY",
-    authDomain: "YOUR_PROJECT.firebaseapp.com",
-    databaseURL: "https://evchargi-default-rtdb.firebaseio.com",
-    projectId: "YOUR_PROJECT_ID",
-    storageBucket: "YOUR_PROJECT.appspot.com",
-    messagingSenderId: "YOUR_SENDER_ID",
-    appId: "YOUR_APP_ID",
+/* ================= Firebase ================= */
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  databaseURL: "https://evchargi-default-rtdb.firebaseio.com",
+  projectId: "YOUR_PROJECT_ID",
+  appId: "YOUR_APP_ID",
+};
+const app = initializeApp(firebaseConfig);
+const db  = getDatabase(app);
+
+/* ================= URL ================= */
+const params = new URLSearchParams(location.search);
+const USER_ID = params.get("id");
+const TYPE = (params.get("type") || "topup").toLowerCase();
+if (!USER_ID) throw "Missing USER_ID";
+
+/* ================= Helpers ================= */
+const pad2 = n => String(n).padStart(2,"0");
+const toNum = v => Number(String(v).replace(/"/g,"")) || 0;
+
+function parseKey(k){
+  const p = k.split("-").map(Number);
+  if(p.length!==6) return null;
+  return new Date(p[0],p[1]-1,p[2],p[3],p[4],p[5]);
+}
+
+function label(mode, d){
+  const y = String(d.getFullYear()).slice(-2);
+  if(mode==="day") return `${pad2(d.getDate())}/${pad2(d.getMonth()+1)}`;
+  if(mode==="month") return `${pad2(d.getMonth()+1)}/${y}`;
+  const w = Math.ceil((((d - new Date(d.getFullYear(),0,1))/86400000)+1)/7);
+  return `W${pad2(w)}/${y}`;
+}
+
+function path(){
+  return TYPE==="consumption"
+    ? `EVCharging/Users/${USER_ID}/Charging/History_Electric_Consumption`
+    : `EVCharging/Users/${USER_ID}/Wallet/History_topup`;
+}
+
+/* ================= Load ================= */
+async function load(){
+  const snap = await get(ref(db,path()));
+  if(!snap.exists()) return [];
+  return Object.entries(snap.val())
+    .map(([k,v])=>{
+      const d=parseKey(k); if(!d) return null;
+      if(TYPE==="topup"){
+        if(typeof v==="object")
+          return {d, a:toNum(v.amount), b:toNum(v.balance_after)};
+        return {d, a:toNum(v), b:null};
+      }
+      return {d, v:toNum(v)};
+    }).filter(Boolean)
+    .sort((a,b)=>a.d-b.d);
+}
+
+/* ================= Chart ================= */
+const ctx=document.getElementById("chart");
+const noData=document.getElementById("noData");
+
+const chart=new Chart(ctx,{
+  type:"line",
+  data:{labels:[],datasets:[]},
+  options:{
+    responsive:true,
+    maintainAspectRatio:false,
+    plugins:{title:{display:false}},
+    scales:{y:{ticks:{callback:v=>v.toLocaleString("vi-VN")}}}
+  }
+});
+
+function showNoData(show){
+  noData.style.display = show ? "flex":"none";
+  ctx.style.display = show ? "none":"block";
+}
+
+/* ================= Group ================= */
+function group(rows,mode){
+  const m=new Map();
+  for(const r of rows){
+    const k=label(mode,r.d);
+    if(!m.has(k)) m.set(k,{k,sum:0,last:r});
+    m.get(k).sum += r.a ?? r.v;
+    m.get(k).last = r;
+  }
+  return [...m.values()];
+}
+
+/* ================= Mode ================= */
+let mode="day";
+["Day","Week","Month"].forEach(t=>{
+  document.getElementById("btn"+t).onclick=()=>{
+    mode=t.toLowerCase(); draw(true);
+    document.querySelectorAll(".btn").forEach(b=>b.classList.remove("active"));
+    document.getElementById("btn"+t).classList.add("active");
   };
+});
+document.getElementById("btnDay").classList.add("active");
 
-  const app = initializeApp(firebaseConfig);
-  const db  = getDatabase(app);
+/* ================= Draw ================= */
+async function draw(force=false){
+  const rows=await load();
 
-  // --------- URL params ----------
-  // ?id=USER_ID&type=topup|consumption
-  const params = new URLSearchParams(window.location.search);
-  const USER_ID = params.get("id") || params.get("uid") || "";
-  const TYPE = (params.get("type") || "topup").toLowerCase(); // topup | consumption
-
-  if (!USER_ID) {
-    document.body.innerHTML =
-      "<div style='padding:14px;font-family:system-ui'>Thiếu USER_ID. Dùng: <b>?id=USER_ID&type=topup</b> hoặc <b>&type=consumption</b></div>";
-    throw new Error("Missing USER_ID");
+  // ✅ ĐIỀU KIỆN: cần >=2 giao dịch
+  if(rows.length < 2){
+    showNoData(true);
+    chart.data.labels=[];
+    chart.data.datasets=[];
+    chart.update();
+    return;
   }
 
-  // --------- Helpers ----------
-  function parseKeyToDate(key) {
-    // yyyy-MM-dd-hh-mm-ss
-    const parts = key.split("-").map(x => parseInt(x, 10));
-    if (parts.length !== 6 || parts.some(n => Number.isNaN(n))) return null;
-    const [y, mo, d, h, mi, s] = parts;
-    return new Date(y, mo - 1, d, h, mi, s);
-  }
+  showNoData(false);
 
-  function toNumber(val) {
-    if (val === null || val === undefined) return 0;
-    const s = String(val).replace(/"/g, "").trim();
-    const n = Number(s);
-    return Number.isFinite(n) ? n : 0;
-  }
+  const g=group(rows,mode);
 
-  function pad2(n){ return String(n).padStart(2, "0"); }
-
-  // ISO week helper
-  function isoWeek(date) {
-    const dt = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
-    const dayNum = dt.getUTCDay() || 7;
-    dt.setUTCDate(dt.getUTCDate() + 4 - dayNum);
-    const yearStart = new Date(Date.UTC(dt.getUTCFullYear(), 0, 1));
-    const week = Math.ceil((((dt - yearStart) / 86400000) + 1) / 7);
-    return { week, weekYear: dt.getUTCFullYear() };
-  }
-
-  // Label theo chế độ (✅ năm 2025 -> 25)
-  function labelForMode(mode, dt) {
-    const y2 = String(dt.getFullYear()).slice(-2); // 2025 -> 25
-    const m = pad2(dt.getMonth() + 1);
-    const d = pad2(dt.getDate());
-
-    if (mode === "day") return `${d}/${m}`;        // dd/MM
-    if (mode === "month") return `${m}/${y2}`;     // MM/YY
-
-    const { week, weekYear } = isoWeek(dt);
-    const wy2 = String(weekYear).slice(-2);
-    return `W${pad2(week)}/${wy2}`;                // Wxx/YY
-  }
-
-  // Key bucket theo chế độ (để group)
-  function bucketKey(mode, dt) {
-    const y = dt.getFullYear();
-    const m = pad2(dt.getMonth() + 1);
-    const d = pad2(dt.getDate());
-    if (mode === "day") return `${y}-${m}-${d}`;         // YYYY-MM-DD
-    if (mode === "month") return `${y}-${m}`;            // YYYY-MM
-    const { week, weekYear } = isoWeek(dt);
-    return `${weekYear}-W${pad2(week)}`;                 // YYYY-Wxx
-  }
-
-  // --------- Firebase paths ----------
-  function pathByType(type) {
-    if (type === "consumption") {
-      return `EVCharging/Users/${USER_ID}/Charging/History_Electric_Consumption`;
-    }
-    return `EVCharging/Users/${USER_ID}/Wallet/History_topup`;
-  }
-
-  // --------- Load rows ----------
-  async function loadRows(type) {
-    const snap = await get(ref(db, pathByType(type)));
-    if (!snap.exists()) return [];
-
-    const obj = snap.val();
-    const rows = Object.entries(obj).map(([k, v]) => {
-      const dt = parseKeyToDate(k);
-      if (!dt) return null;
-
-      if (type === "topup") {
-        let amount = 0;
-        let balanceAfter = null;
-
-        // object: {amount, balance_after}
-        if (typeof v === "object" && v !== null) {
-          amount = toNumber(v.amount);
-          if (v.balance_after !== undefined) balanceAfter = toNumber(v.balance_after);
-        } else {
-          // string/number: "50000"
-          amount = toNumber(v);
-        }
-        return { key: k, date: dt, amount, balanceAfter };
-      }
-
-      // consumption
-      return { key: k, date: dt, value: toNumber(v) };
-    }).filter(Boolean);
-
-    rows.sort((a,b) => a.date - b.date);
-    return rows;
-  }
-
-  // --------- Group/Aggregate ----------
-  function groupTopup(rows, mode) {
-    const map = new Map();
-
-    for (const r of rows) {
-      const bk = bucketKey(mode, r.date);
-      if (!map.has(bk)) {
-        map.set(bk, { bucket: bk, amountSum: 0, lastBalanceAfter: null, lastDate: r.date });
-      }
-      const it = map.get(bk);
-      it.amountSum += r.amount;
-
-      if (r.date >= it.lastDate) {
-        it.lastDate = r.date;
-        if (r.balanceAfter !== null) it.lastBalanceAfter = r.balanceAfter;
-      }
-    }
-
-    const grouped = Array.from(map.values()).sort((a,b) => a.bucket.localeCompare(b.bucket));
-
-    let run = 0;
-    const hasReal = grouped.some(g => g.lastBalanceAfter !== null);
-
-    const out = grouped.map(g => {
-      run += g.amountSum; // cộng dồn theo bucket
-      const bal = (hasReal && g.lastBalanceAfter !== null) ? g.lastBalanceAfter : run;
-      return { date: g.lastDate, amount: g.amountSum, balance: bal };
-    });
-
-    return { points: out, hasRealBalance: hasReal };
-  }
-
-  function groupConsumption(rows, mode) {
-    const map = new Map();
-    for (const r of rows) {
-      const bk = bucketKey(mode, r.date);
-      if (!map.has(bk)) map.set(bk, { bucket: bk, sum: 0, lastDate: r.date });
-      const it = map.get(bk);
-      it.sum += r.value;
-      if (r.date >= it.lastDate) it.lastDate = r.date;
-    }
-    const grouped = Array.from(map.values()).sort((a,b) => a.bucket.localeCompare(b.bucket));
-    return grouped.map(g => ({ date: g.lastDate, value: g.sum }));
-  }
-
-  // --------- Chart init ----------
-  const ctx = document.getElementById("chart");
-
-  const chart = new Chart(ctx, {
-    type: "line",
-    data: { labels: [], datasets: [] },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        title: { display: false }, // ✅ bỏ title
-        legend: { display: true }
+  if(TYPE==="topup"){
+    let run=0;
+    chart.data.labels=g.map(x=>x.k);
+    chart.data.datasets=[
+      {
+        label:"Tiền nạp (nghìn)",
+        data:g.map(x=>x.sum/1000)
       },
-      scales: {
-        y: {
-          ticks: {
-            // ✅ Topup: hiển thị nghìn (đã chia 1000 ở data) -> 300.000 => 300
-            // Consumption: giữ nguyên
-            callback: (v) => {
-              const num = Number(v);
-              if (!Number.isFinite(num)) return v;
-              return num.toLocaleString("vi-VN");
-            }
-          }
-        }
+      {
+        label:"Số dư sau nạp (nghìn)",
+        data:g.map(x=>{
+          run+=x.sum;
+          return (x.last.b??run)/1000;
+        })
       }
-    }
-  });
-
-  function setDatasetsForType(type, topupHasRealBalance) {
-    if (type === "topup") {
-      chart.data.datasets = [
-        { label: "Tiền nạp (nghìn)", data: [], tension: 0.25, pointRadius: 3 },
-        { label: topupHasRealBalance ? "Số dư sau nạp (nghìn)" : "Số dư sau nạp (nghìn)", data: [], tension: 0.25, pointRadius: 3 }
-      ];
-    } else {
-      chart.data.datasets = [
-        { label: "Điện năng đã sạc", data: [], tension: 0.25, pointRadius: 3 }
-      ];
-    }
+    ];
+  } else {
+    chart.data.labels=g.map(x=>x.k);
+    chart.data.datasets=[{
+      label:"Tiêu thụ",
+      data:g.map(x=>x.sum)
+    }];
   }
+  chart.update();
+}
 
-  // --------- Mode buttons ----------
-  const btnDay   = document.getElementById("btnDay");
-  const btnWeek  = document.getElementById("btnWeek");
-  const btnMonth = document.getElementById("btnMonth");
-
-  let mode = "day"; // day | week | month
-
-  function setActive() {
-    btnDay.classList.toggle("active", mode === "day");
-    btnWeek.classList.toggle("active", mode === "week");
-    btnMonth.classList.toggle("active", mode === "month");
-  }
-
-  btnDay.onclick = () => { mode = "day"; setActive(); lastSig = ""; tick(true); };
-  btnWeek.onclick = () => { mode = "week"; setActive(); lastSig = ""; tick(true); };
-  btnMonth.onclick = () => { mode = "month"; setActive(); lastSig = ""; tick(true); };
-
-  setActive();
-
-  // --------- Render ----------
-  function fmtX(dt) { return labelForMode(mode, dt); }
-
-  function renderTopup(grouped, hasRealBalance) {
-    setDatasetsForType("topup", hasRealBalance);
-
-    chart.data.labels = grouped.map(p => fmtX(p.date));
-
-    // ✅ VND -> nghìn đồng
-    chart.data.datasets[0].data = grouped.map(p => p.amount / 1000);
-    chart.data.datasets[1].data = grouped.map(p => p.balance / 1000);
-
-    chart.update();
-  }
-
-  function renderConsumption(grouped) {
-    setDatasetsForType("consumption", false);
-
-    chart.data.labels = grouped.map(p => fmtX(p.date));
-    chart.data.datasets[0].data = grouped.map(p => p.value);
-
-    chart.update();
-  }
-
-  // --------- Auto refresh 2s ----------
-  let lastSig = "";
-
-  async function tick(force = false) {
-    try {
-      const rows = await loadRows(TYPE);
-
-      const sig = TYPE === "topup"
-        ? JSON.stringify(rows.map(r => [r.key, r.amount, r.balanceAfter]))
-        : JSON.stringify(rows.map(r => [r.key, r.value]));
-
-      if (!force && sig === lastSig) return;
-      lastSig = sig;
-
-      if (TYPE === "topup") {
-        const { points, hasRealBalance } = groupTopup(rows, mode);
-        renderTopup(points, hasRealBalance);
-      } else {
-        const points = groupConsumption(rows, mode);
-        renderConsumption(points);
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  tick(true);
-  setInterval(() => tick(false), 2000);
-
+draw(true);
+setInterval(draw,2000);
 </script>
 </body>
 </html>
